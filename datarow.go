@@ -85,16 +85,17 @@ func (dR DataRow) TabString() string {
 
 func (dR DataRow) String() string {
 	var sb strings.Builder
+  var s string
 	for idx, ptr := range dR {
 		if idx > 0 {
 			sb.WriteString(", ")
 		}
-		s := ptr.String()
-		if ptr.Typ == DVText {
+		s = ptr.String()
+		if ptr.Typ == DVText || ptr.Typ ==DVDate {
 			sb.WriteString(strconv.Quote(s))
-		} else {
-			sb.WriteString(s)
-		}
+    } else {
+      sb.WriteString(s)
+    }
 	}
 	return sb.String()
 }

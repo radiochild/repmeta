@@ -57,7 +57,8 @@ func formatOffset(page, maxRecs int) string {
 		return ""
 	}
 	startRec := page * maxRecs
-	return fmt.Sprintf("offset %d limit %d", startRec, maxRecs)
+	// return fmt.Sprintf("offset %d limit %d", startRec, maxRecs)
+	return fmt.Sprintf("limit %d offset %d", maxRecs, startRec)
 }
 
 func FormatQuery(spec *ReportSpec, maxRecs int, logger *zap.SugaredLogger) string {

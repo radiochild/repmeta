@@ -1,10 +1,9 @@
 package repmeta
 
 import (
+  "database/sql"
 	"fmt"
 	"time"
-
-	"github.com/jackc/pgtype"
 )
 
 type DataValPtr interface{}
@@ -41,11 +40,12 @@ func NewDVBoolean(v ...bool) *DataVal {
 }
 
 func NewDVText(v ...string) *DataVal {
-	var val string
+  nullStr := sql.NullString {}
 	if len(v) > 0 {
-		val = v[0]
+		nullStr.String = v[0]
+    nullStr.Valid = true
 	}
-	dv := DataVal{Typ: DVText, Ptr: &val}
+	dv := DataVal{Typ: DVText, Ptr: &nullStr}
 	return &dv
 }
 
@@ -77,13 +77,12 @@ func NewDVFloat(v ...float64) *DataVal {
 }
 
 func NewDVDate(v ...time.Time) *DataVal {
-	val := time.Now()
+  nullStr := sql.NullString{}
 	if len(v) > 0 {
-		val = v[0]
+		nullStr.String = v[0].Format("2006-01-01")
+    nullStr.Valid = true
 	}
-	pgVal := new(pgtype.Date)
-	pgVal.Time = val
-	dv := DataVal{Typ: DVDate, Ptr: pgVal}
+	dv := DataVal{Typ: DVDate, Ptr: &nullStr}
 	return &dv
 }
 
@@ -135,11 +134,12 @@ func (dv *DataVal) ToNone() {
 func (dv *DataVal) ToText(v ...*string) {
 	dv.ToNone()
 	dv.Typ = DVText
-	if len(v) == 0 {
-		dv.Ptr = new(string)
-	} else {
-		dv.Ptr = v[0]
+  nullStr := sql.NullString{}
+	if len(v) > 0 {
+    nullStr.Valid = true
+    nullStr.String = *v[0]
 	}
+  dv.Ptr = &nullStr
 }
 
 func (dv *DataVal) ToInt(v ...*int64) {
@@ -185,14 +185,13 @@ func (dv *DataVal) ToBool(v ...*bool) {
 func (dv *DataVal) ToDate(v ...*time.Time) {
 	dv.ToNone()
 	dv.Typ = DVDate
-	pDt := new(pgtype.Date)
-	dv.Ptr = pDt
-	if len(v) == 0 {
-		pDt.Time = time.Time{}
-	} else {
-		pTime := v[0]
-		pDt.Time = *pTime
+  nullStr := sql.NullString{}
+	if len(v) > 0 {
+    pTime := *v[0]
+    nullStr.Valid = true
+    nullStr.String = pTime.Format("2006-01-02")
 	}
+  dv.Ptr = &nullStr
 }
 
 func (dv *DataVal) String() string {
@@ -200,19 +199,22 @@ func (dv *DataVal) String() string {
 	case DVNone:
 		return ""
 	case DVDate:
-		pDt := dv.Ptr.(*pgtype.Date)
-		pTime := pDt.Time
-		if pTime.IsZero() {
-			return ""
-		}
-		return pTime.Format("2006-01-02")
+    nullStr := *dv.Ptr.(*sql.NullString)
+    if nullStr.Valid {
+      return nullStr.String
+    }
+    return ""
 	case DVCurrency:
 		pennies := *dv.Ptr.(*int64)
 		dollars := pennies / 100
 		cents := pennies % 100
 		return fmt.Sprintf("%d.%2.2d", dollars, cents)
 	case DVText:
-		return *dv.Ptr.(*string)
+    nullStr := *dv.Ptr.(*sql.NullString)
+    if nullStr.Valid {
+      return nullStr.String
+    }
+    return ""
 	case DVInt:
 		return fmt.Sprintf("%d", *dv.Ptr.(*int64))
 	case DVFloat:
