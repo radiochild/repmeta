@@ -1,6 +1,7 @@
 package repmeta
 
 import (
+  "context"
 	reptext "github.com/radiochild/utils/text"
 	"encoding/json"
 	"fmt"
@@ -10,6 +11,8 @@ import (
 
 	"github.com/vmihailenco/msgpack/v5"
 	"go.uber.org/zap"
+	"github.com/aws/aws-sdk-go-v2/service/s3"
+  "github.com/aws/aws-sdk-go-v2/aws"
 )
 
 type OutputType int
@@ -100,11 +103,33 @@ func (rW *ReportWriter) ProcessGrandTotals() {
 	rW.FlushRows()
 }
 
-func NewReportWriter(pLogger *zap.SugaredLogger, wx io.Writer, outputType OutputType, suppressDetails bool, spec *ReportSpec) *ReportWriter {
+func NewReportWriter(pLogger *zap.SugaredLogger, wx io.Writer, outputType OutputType, suppressDetails bool, spec *ReportSpec, s3Client *s3.Client, bucketName string) *ReportWriter {
 	rW := new(ReportWriter)
 	rW.logger = pLogger
 	rW.outputType = outputType
 	rW.outwriter = wx
+
+  useS3 := len(bucketName) > 0
+  if useS3 {
+
+    // Get the first page of results for ListObjectsV2 for a bucket
+    ctx := context.TODO()
+    output, err := s3Client.ListObjectsV2(ctx, &s3.ListObjectsV2Input{
+      Bucket: aws.String(bucketName),
+    })
+    if err != nil {
+      rW.logger.Fatal(err.Error())
+    }
+
+    rW.logger.Infof("Objects in bucket %q:", bucketName)
+    if len(output.Contents) == 0 {
+      rW.logger.Info("-- none --")
+    }
+    for _, object := range output.Contents {
+      rW.logger.Infof("  %s (%d bytes)", aws.ToString(object.Key), object.Size)
+    }
+  }
+
 
 	if rW.outputType == OTText {
 		// minwidth, tabwidth, padding, padChar
