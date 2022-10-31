@@ -1,6 +1,7 @@
 package repmeta
 
 import (
+  "bytes"
   "context"
 	reptext "github.com/radiochild/utils/text"
 	"encoding/json"
@@ -11,8 +12,9 @@ import (
 
 	"github.com/vmihailenco/msgpack/v5"
 	"go.uber.org/zap"
-	"github.com/aws/aws-sdk-go-v2/service/s3"
   "github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/service/s3"
+  "github.com/aws/aws-sdk-go-v2/service/s3/types"
 )
 
 type OutputType int
@@ -23,15 +25,23 @@ const (
 	OTMessagePack
 )
 
+const MinS3BufSize int64 = 5 * 1024 * 1024
+
 type ReportWriter struct {
 	logger          *zap.SugaredLogger
 	outwriter       io.Writer
 	outputType      OutputType
+  outputName      string
 	spec            *ReportSpec
 	levels          []*ReportLevel
 	grandTotals     *ReportLevel
 	suppressDetails bool
 	wantDashes      bool
+  s3Client        *s3.Client
+  bucketName      string
+  uploadId        string
+  parts           []types.CompletedPart
+  streamBuf       *bytes.Buffer
 }
 
 type ReportRow struct {
@@ -50,29 +60,49 @@ func (rW *ReportWriter) EmitRow(rowType string, rowLevel int, levelName string, 
 		LevelCount: levelCount,
 		Values:     values,
 	}
+  var oStr string
+  var err error
+  var oData []byte
+
 	switch rW.outputType {
 	case OTText:
 		summaryName := rOut.LevelName
 		if rOut.LevelCount > 0 {
 			summaryName = fmt.Sprintf("%s [%d]", rOut.LevelName, rOut.LevelCount)
 		}
-		fmt.Fprintf(rW.outwriter, "%s-%d\t%s\t%s\t\n", rOut.RowType, rOut.RowLevel, summaryName, reptext.TabString(rOut.Values))
+		oStr = fmt.Sprintf("%s-%d\t%s\t%s\t\n", rOut.RowType, rOut.RowLevel, summaryName, reptext.TabString(rOut.Values))
+    oData = []byte(oStr)
 	case OTJSON:
-		data, err := json.Marshal(rOut)
+		oData, err = json.Marshal(rOut)
 		if err != nil {
 			return err
 		}
-		// fmt.Fprintln(rW.outwriter, string(data))
-		fmt.Fprintf(rW.outwriter, "%s\n", string(data))
+    oData = append(oData, '\n')
 	case OTMessagePack:
-		data, err := msgpack.Marshal(rOut)
+		oData, err = msgpack.Marshal(rOut)
 		if err != nil {
 			return err
 		}
-		// fmt.Fprintln(rW.outwriter, string(data))
-		// rW.outwriter.WriteString(string(data))
-		rW.outwriter.Write(data)
 	}
+
+  // Before emitting, see if this should be buffered/streamed to s3
+  useS3 := len(rW.bucketName) > 0
+  if useS3 {
+
+    // Append oData buffer to  streaming buffer
+    rW.streamBuf.Write(oData)
+    bufSize := int64(rW.streamBuf.Len())
+
+    if bufSize > MinS3BufSize {
+      // Stream to s3
+      rW.Flush(MinS3BufSize)
+      rW.streamBuf.Reset()
+    }
+
+    return nil
+  }
+
+  rW.outwriter.Write(oData)
 	return nil
 }
 
@@ -103,31 +133,41 @@ func (rW *ReportWriter) ProcessGrandTotals() {
 	rW.FlushRows()
 }
 
-func NewReportWriter(pLogger *zap.SugaredLogger, wx io.Writer, outputType OutputType, suppressDetails bool, spec *ReportSpec, s3Client *s3.Client, bucketName string) *ReportWriter {
+func NewReportWriter(pLogger *zap.SugaredLogger, wx io.Writer, outputType OutputType, outputName string, suppressDetails bool, spec *ReportSpec, s3Client *s3.Client, bucketName string) *ReportWriter {
 	rW := new(ReportWriter)
 	rW.logger = pLogger
 	rW.outputType = outputType
 	rW.outwriter = wx
-
-  useS3 := len(bucketName) > 0
+  rW.outputName = outputName
+  rW.bucketName = bucketName
+  rW.s3Client = s3Client
+  useS3 := len(rW.bucketName) > 0
   if useS3 {
+    rW.streamBuf = new(bytes.Buffer)
 
-    // Get the first page of results for ListObjectsV2 for a bucket
+    //struct for starting a multipart upload
+    startInput := s3.CreateMultipartUploadInput{
+        Bucket: aws.String(rW.bucketName),
+        Key:    aws.String(rW.outputName),
+    }
+
+    //send command to start copy and get the upload id as it is needed later
     ctx := context.TODO()
-    output, err := s3Client.ListObjectsV2(ctx, &s3.ListObjectsV2Input{
-      Bucket: aws.String(bucketName),
-    })
+    uploadId := ""
+    createOutput, err := rW.s3Client.CreateMultipartUpload(ctx, &startInput)
     if err != nil {
-      rW.logger.Fatal(err.Error())
+        rW.logger.Fatal(err.Error())
     }
-
-    rW.logger.Infof("Objects in bucket %q:", bucketName)
-    if len(output.Contents) == 0 {
-      rW.logger.Info("-- none --")
+    if createOutput != nil {
+        if createOutput.UploadId != nil {
+            uploadId = *createOutput.UploadId
+        }
     }
-    for _, object := range output.Contents {
-      rW.logger.Infof("  %s (%d bytes)", aws.ToString(object.Key), object.Size)
+    if uploadId == "" {
+        rW.logger.Fatal("No upload id found in start upload request")
     }
+    rW.uploadId = uploadId
+    rW.parts = make([]types.CompletedPart, 0)
   }
 
 
@@ -348,4 +388,90 @@ func ShowReportWriter(rW *ReportWriter) {
 	for _, lx := range ctxLines {
 		rW.logger.Infof("%s\n", lx)
 	}
+}
+
+// minSize 1 is used to flush anything remaining
+// Otherwise, minSize is 5 * 1024 * 1024
+func (rW *ReportWriter) Flush(minSize int64) error {
+  usesS3 := len(rW.bucketName) > 0
+  if !usesS3 {
+    return nil
+  }
+
+  ctx := context.TODO()
+  var err error
+  var partOutput *s3.UploadPartOutput
+
+  numbytes := int64(rW.streamBuf.Len())
+  if numbytes >= minSize {
+    partNumber := int32(len(rW.parts) + 1)
+    partInput := s3.UploadPartInput{
+      Bucket:          aws.String(rW.bucketName),
+      Key:             aws.String(rW.outputName),
+      PartNumber:      partNumber,
+      UploadId:        aws.String(rW.uploadId),
+      Body:            rW.streamBuf,
+      ContentLength:   numbytes,
+    }
+    rW.logger.Debugf("Attempting to upload part %d", partNumber)
+    partOutput, err = rW.s3Client.UploadPart(ctx, &partInput)
+
+    // If successful, copy the part and retain for the summary
+    // Part is an eTag and its related partNumber
+    if err == nil {
+      part := types.CompletedPart {
+        ETag: partOutput.ETag,
+        PartNumber: partNumber,
+      }
+      rW.parts = append(rW.parts, part)
+      rW.logger.Infof("Successfully uploaded part %d (ETag: %s) to %s/%s", partNumber, *partOutput.ETag, rW.bucketName, rW.outputName)
+    }
+  }
+  return err 
+}
+
+func (rW *ReportWriter) CompleteUpload() error {
+  usesS3 := len(rW.bucketName) > 0
+  if !usesS3 {
+    return nil
+  }
+
+  ctx := context.TODO()
+
+  // Complete the MultiPart operation
+  //create struct for completing the upload
+  mpu := types.CompletedMultipartUpload{
+     Parts: rW.parts,
+  }
+
+  //complete actual upload
+  //does not actually copy if the complete command is not received
+  complete := s3.CompleteMultipartUploadInput{
+    Bucket:          aws.String(rW.bucketName),
+    Key:             aws.String(rW.outputName),
+    UploadId:        aws.String(rW.uploadId),
+    MultipartUpload: &mpu,
+  }
+  compOutput, err := rW.s3Client.CompleteMultipartUpload(ctx, &complete)
+  if err != nil {
+    return err
+  }
+
+  if compOutput == nil {
+    return fmt.Errorf("Unable to complete multipart upload (but err was nil)")
+  }
+
+  rW.logger.Infof("Successfully uploaded to %s/%s", rW.bucketName, rW.outputName)
+  return nil
+}
+
+func (rW *ReportWriter) Close() error {
+  err := rW.Flush(1) // Any buffered data still needs to be sent
+
+  if err != nil {
+    return err
+  }
+
+  err = rW.CompleteUpload()
+  return err
 }
